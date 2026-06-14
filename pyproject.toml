@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=65"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "epxtool"
+version = "1.1.0"
+description = "ePotala Security Toolkit for authorized assessment and incident analysis"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE.md" }
+authors = [
+  { name = "ePotala Security" }
+]
+dependencies = []
+
+[tool.setuptools]
+packages = ["epxtool"]
+script-files = ["epx-recon", "epx-forensics", "epx-report", "epx-verify"]
+
+[tool.mypy]
+ignore_missing_imports = true
+
+[tool.pylint.main]
+py-version = "3.10"

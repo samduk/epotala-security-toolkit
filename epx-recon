@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""
+epx-recon
+=========
+
+Command-line tool that scans ONE website and saves the result as a .json file.
+That .json file is then turned into a report with the `epx-report` tool.
+
+Examples:
+  ./epx-recon http://site.tld --output reports/site.json
+  ./epx-recon site.tld --authorize          (skip the "are you sure?" prompt)
+  ./epx-recon --list-checks                  (just show what it checks for)
+"""
+
+import argparse
+import getpass
+import json
+import os
+import sys
+
+# Make sure Python can find the "epxtool" package that lives next to this file.
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+from epxtool import __version__, SHORT_NAME
+from epxtool.checks import ALL_CHECKS
+from epxtool.cve import SUPPORTED_SOURCES
+from epxtool.io_utils import write_artifact
+from epxtool.scanner import now_text, run_scan, tidy_target
+
+
+def main():
+    # 1) Describe the command-line options.
+    parser = argparse.ArgumentParser(
+        prog="epx-recon",
+        description=(
+            "EPX Recon: scan a WordPress/WooCommerce site read-only and save "
+            "JSON results."
+        ),
+    )
+    parser.add_argument("target", nargs="?",
+                        help="Site address or host, e.g. http://site.tld")
+    parser.add_argument("-o", "--output",
+                        help="Where to save the JSON (default: print to screen)")
+    parser.add_argument("--timeout", type=float, default=10.0,
+                        help="Seconds to wait for each request (default: 10)")
+    parser.add_argument("--delay", type=float, default=0.1,
+                        help="Minimum seconds between requests (default: 0.1)")
+    parser.add_argument("--max-requests", type=int, default=100,
+                        help="Hard request limit for one scan (default: 100)")
+    parser.add_argument("--max-response-mb", type=float, default=2.0,
+                        help="Maximum response size in MB (default: 2, maximum: 10)")
+    parser.add_argument("--insecure", action="store_true",
+                        help="Do not check HTTPS certificates")
+    parser.add_argument("--only",
+                        help="Run only these checks (comma-separated ids)")
+    parser.add_argument("--cve-source", choices=SUPPORTED_SOURCES,
+                        help="Opt-in: correlate detected components against this "
+                             "vulnerability feed. Sends component names off-host.")
+    parser.add_argument("--cve-api-key", default="",
+                        help="API key for --cve-source (or set WPSCAN_API_KEY)")
+    parser.add_argument("--authorize", action="store_true",
+                        help="Non-interactive authorization affirmation")
+    parser.add_argument("--authorization-ref", "--authorization-reference",
+                        dest="authorization_ref",
+                        help="Written permission/SOW/ticket reference")
+    parser.add_argument("--operator",
+                        default=getpass.getuser(),
+                        help="Person operating the scan")
+    parser.add_argument("--client",
+                        default="",
+                        help="Client or organization name recorded in the scan")
+    parser.add_argument("--list-checks", action="store_true",
+                        help="List the available checks and exit")
+    parser.add_argument("--quiet", action="store_true",
+                        help="Do not print progress")
+    parser.add_argument("--version", action="version",
+                        version=SHORT_NAME + " " + __version__)
+    args = parser.parse_args()
+
+    # 2) If asked, just list the checks and stop.
+    if args.list_checks:
+        for check_id, _check_function in ALL_CHECKS:
+            print(check_id)
+        return 0
+
+    # 3) We need a target for everything else.
+    if not args.target:
+        parser.error("please give a target, or use --list-checks")
+    if args.timeout <= 0:
+        parser.error("--timeout must be greater than zero")
+    if args.timeout > 120:
+        parser.error("--timeout cannot exceed 120 seconds")
+    if args.delay < 0 or args.delay > 10:
+        parser.error("--delay must be between 0 and 10 seconds")
+    if args.max_requests < 1 or args.max_requests > 1000:
+        parser.error("--max-requests must be between 1 and 1000")
+    if args.max_response_mb <= 0 or args.max_response_mb > 10:
+        parser.error("--max-response-mb must be greater than 0 and at most 10")
+
+    try:
+        tidy_target(args.target)
+    except ValueError as error:
+        parser.error(str(error))
+
+    # 4) Record permission before making any requests.
+    authorization_reference = (args.authorization_ref or "").strip()
+    operator = (args.operator or "").strip()
+    if not operator:
+        parser.error("--operator cannot be empty")
+
+    if args.authorize:
+        if not authorization_reference:
+            parser.error("--authorize requires --authorization-ref")
+    else:
+        sys.stderr.write(
+            "\n  You are about to scan: " + args.target + "\n"
+            "  Only scan sites you own or are clearly allowed to test.\n"
+            "  Type AUTHORIZED to confirm written permission: "
+        )
+        answer = ""
+        try:
+            answer = input().strip()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if answer != "AUTHORIZED":
+            sys.stderr.write("Cancelled.\n")
+            return 2
+        if not authorization_reference:
+            try:
+                authorization_reference = input(
+                    "  Authorization/SOW/ticket reference: "
+                ).strip()
+            except (EOFError, KeyboardInterrupt):
+                authorization_reference = ""
+        if not authorization_reference:
+            sys.stderr.write("Cancelled: an authorization reference is required.\n")
+            return 2
+
+    authorization = {
+        "confirmed": True,
+        "reference": authorization_reference,
+        "operator": operator,
+        "client": args.client.strip(),
+        "confirmed_at": now_text(),
+    }
+
+    # 5) Decide how to print progress.
+    if args.quiet:
+        log = lambda message: None
+    else:
+        log = lambda message: sys.stderr.write(message + "\n")
+
+    # 6) Work out which checks to run (all, or a chosen few).
+    only = None
+    if args.only:
+        only = [name.strip() for name in args.only.split(",") if name.strip()]
+        known_checks = [check_id for check_id, _check_function in ALL_CHECKS]
+        unknown_checks = [name for name in only if name not in known_checks]
+        if unknown_checks:
+            parser.error(
+                "unknown check id(s): " + ", ".join(unknown_checks) +
+                ". Use --list-checks to see valid ids."
+            )
+        if not only:
+            parser.error("--only must contain at least one check id")
+
+    # 7) Resolve opt-in CVE correlation (it sends component names to a feed).
+    cve_api_key = ""
+    if args.cve_source:
+        cve_api_key = (args.cve_api_key or os.environ.get("WPSCAN_API_KEY", "")).strip()
+        if not cve_api_key:
+            parser.error(
+                "--cve-source requires --cve-api-key or the WPSCAN_API_KEY "
+                "environment variable"
+            )
+        sys.stderr.write(
+            "\n  CVE correlation is ENABLED (" + args.cve_source + ").\n"
+            "  Detected component names and versions will be sent to this\n"
+            "  third-party feed, leaving the engagement boundary. Only proceed\n"
+            "  if your authorization permits this.\n\n"
+        )
+
+    # 8) Run the scan.
+    log("[*] epxtool " + __version__ + " scanning " + args.target)
+    result = run_scan(
+        args.target,
+        timeout=args.timeout,
+        verify_tls=not args.insecure,
+        only=only,
+        log=log,
+        authorization=authorization,
+        delay=args.delay,
+        max_requests=args.max_requests,
+        max_response_bytes=int(args.max_response_mb * 1024 * 1024),
+        cve_source=args.cve_source,
+        cve_api_key=cve_api_key,
+    )
+
+    # 9) Save (or print) the result as JSON.
+    text = json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    if args.output:
+        try:
+            digest = write_artifact(args.output, text, mode=0o600)
+        except OSError as error:
+            sys.stderr.write("error: could not save JSON: " + str(error) + "\n")
+            return 1
+        finding_word = "finding" if len(result["findings"]) == 1 else "findings"
+        log("[+] Found " + str(len(result["findings"])) + " " +
+            finding_word + ". Saved to " + args.output)
+        log("[+] SHA-256: " + digest)
+    else:
+        sys.stdout.write(text)
+
+    if result["status"] != "complete":
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

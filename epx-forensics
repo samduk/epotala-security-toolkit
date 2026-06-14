@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""Analyze supplied incident evidence without executing or modifying it."""
+
+import argparse
+import json
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+from epxtool import __version__, SHORT_NAME
+from epxtool.forensics import run_forensics
+from epxtool.forensics_schema import validate_forensics_result
+from epxtool.io_utils import write_artifact
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="epx-forensics",
+        description=(
+            "EPX Forensics: analyze access logs, supported archives, PHP "
+            "artifacts, and SQL dumps offline."
+        ),
+    )
+    parser.add_argument("source", help="Evidence file or folder")
+    parser.add_argument("-o", "--output", required=True,
+                        help="Where to save the forensic JSON")
+    parser.add_argument("--case-id", required=True,
+                        help="Incident or engagement case identifier")
+    parser.add_argument("--site", default="",
+                        help="Affected site or hostname")
+    parser.add_argument("--authorization-ref", required=True,
+                        help="Contract, SOW, ticket, or evidence-transfer reference")
+    parser.add_argument("--operator", required=True,
+                        help="Analyst running the evidence analysis")
+    parser.add_argument("--client", required=True,
+                        help="Client or organization name")
+    parser.add_argument("--version", action="version",
+                        version=SHORT_NAME + " " + __version__)
+    args = parser.parse_args()
+
+    result = run_forensics(
+        args.source,
+        case_id=args.case_id,
+        site=args.site,
+        authorization_reference=args.authorization_ref,
+        operator=args.operator,
+        client=args.client,
+    )
+    try:
+        validate_forensics_result(result)
+        text = json.dumps(result, indent=2, ensure_ascii=True) + "\n"
+        digest = write_artifact(args.output, text, mode=0o600)
+    except (OSError, ValueError) as error:
+        sys.stderr.write("error: could not save forensic result: " + str(error) + "\n")
+        return 1
+
+    sys.stderr.write("[+] Saved forensic JSON to " + args.output + "\n")
+    sys.stderr.write("[+] Status: " + result["status"] + "\n")
+    sys.stderr.write("[+] Findings: " + str(len(result["findings"])) + "\n")
+    sys.stderr.write("[+] Timeline events: " + str(len(result["timeline"])) + "\n")
+    sys.stderr.write("[+] SHA-256: " + digest + "\n")
+    return 0 if result["status"] != "failed" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

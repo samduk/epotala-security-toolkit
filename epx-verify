@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""Verify an epxtool artifact and, for JSON scans, validate its schema."""
+
+import argparse
+import json
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+from epxtool import __version__, SHORT_NAME
+from epxtool.io_utils import verify_artifact
+from epxtool.forensics_schema import validate_forensics_result
+from epxtool.schema import validate_result
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="epx-verify",
+        description=(
+            "EPX Verify: verify an artifact SHA-256 sidecar and JSON schema."
+        ),
+    )
+    parser.add_argument("artifact", help="Scan or report file to verify")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=SHORT_NAME + " " + __version__,
+    )
+    args = parser.parse_args()
+
+    try:
+        digest, verified = verify_artifact(args.artifact)
+    except OSError as error:
+        sys.stderr.write("error: could not read artifact: " + str(error) + "\n")
+        return 1
+
+    if verified is None:
+        sys.stderr.write("error: no SHA-256 sidecar found\n")
+        return 2
+    if verified is False:
+        sys.stderr.write("error: SHA-256 mismatch\n")
+        return 1
+
+    if args.artifact.lower().endswith(".json"):
+        try:
+            with open(args.artifact, "r", encoding="utf-8") as handle:
+                result = json.load(handle)
+            if result.get("artifact_type") == "forensics":
+                validate_forensics_result(result)
+            else:
+                validate_result(result)
+        except (OSError, ValueError) as error:
+            sys.stderr.write("error: invalid epxtool JSON: " + str(error) + "\n")
+            return 1
+
+    print("verified: " + args.artifact)
+    print("sha256: " + digest)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

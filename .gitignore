@@ -1,0 +1,40 @@
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pylint.d/
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+dist/
+build/
+*.egg-info/
+
+# Generated assessment and forensic artifacts. Never commit client reports.
+reports/
+analysis/
+
+# Local configuration and credentials.
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Evidence, exports, databases, logs, and archives.
+evidence/
+files/
+accesslogs/
+*.log
+*_log
+*.sql
+*.sqlite
+*.sqlite3
+*.db
+*.gz
+*.tgz
+*.tar
+*.tar.gz
+*.zip
