@@ -530,6 +530,90 @@ class ForensicsTests(unittest.TestCase):
             self.assertIn("Incident timeline", html_report)
             json.dumps(result)
 
+    def test_authentication_logs_are_correlated_without_access_log_noise(self):
+        with tempfile.TemporaryDirectory() as folder:
+            lines = []
+            for second in range(20):
+                lines.append(
+                    "2026-06-14T01:00:" + str(second).zfill(2) +
+                    "+00:00 host sshd[100]: Failed password for root from "
+                    "192.0.2.55 port 50000 ssh2\n"
+                )
+            lines.append(
+                "2026-06-14T01:01:00+00:00 host sshd[101]: "
+                "Accepted password for root from 192.0.2.55 port 50000 ssh2\n"
+            )
+            (Path(folder) / "auth.log").write_text(
+                "".join(lines), encoding="utf-8"
+            )
+            result = run_forensics(
+                folder, "CASE-AUTH", site="example.test",
+                authorization_reference="SOW-AUTH", operator="Analyst",
+                client="Client", source_timezone="UTC",
+            )
+            titles = {item["title"] for item in result["findings"]}
+            self.assertIn("Automated SSH authentication attacks", titles)
+            self.assertIn(
+                "Successful SSH authentication requires validation", titles
+            )
+            self.assertEqual(result["statistics"]["log_lines"], 0)
+            self.assertEqual(result["statistics"]["auth_log_lines"], 21)
+            self.assertEqual(result["assessment"]["initial_access"], "possible")
+            validate_forensics_result(result)
+
+    def test_wordpress_acquisition_inventory_and_report_coverage(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "wp-admin").mkdir()
+            (root / "wp-includes").mkdir()
+            (root / "wp-content/plugins/example").mkdir(parents=True)
+            (root / "wp-content/themes/example").mkdir(parents=True)
+            (root / "wp-content/uploads/2026/06").mkdir(parents=True)
+            (root / "wp-admin/index.php").write_text(
+                "<?php echo 'admin';", encoding="utf-8"
+            )
+            (root / "wp-includes/version.php").write_text(
+                "<?php $wp_version = '6.8.1';", encoding="utf-8"
+            )
+            (root / "wp-content/plugins/example/plugin.php").write_text(
+                "<?php echo 'plugin';", encoding="utf-8"
+            )
+            (root / "wp-content/themes/example/functions.php").write_text(
+                "<?php echo 'theme';", encoding="utf-8"
+            )
+            (root / "wp-content/uploads/2026/06/review.php").write_text(
+                "<?php echo 'review';", encoding="utf-8"
+            )
+            (root / "wp-config.php").write_text(
+                "<?php define('DB_NAME', 'example');", encoding="utf-8"
+            )
+            result = run_forensics(
+                folder, "CASE-WP", site="example.test",
+                authorization_reference="SOW-WP", operator="Analyst",
+                client="Client", received_at="2026-06-14T10:30:00+05:30",
+                received_from="Client", collection_method="Encrypted transfer",
+                source_timezone="Asia/Kolkata", originals_preserved=True,
+                incident_state="contained",
+            )
+            wordpress = result["wordpress"]
+            self.assertTrue(wordpress["core_present"])
+            self.assertTrue(wordpress["wp_config_present"])
+            self.assertEqual(wordpress["version"], "6.8.1")
+            self.assertEqual(wordpress["plugins"], ["example"])
+            self.assertEqual(wordpress["themes"], ["example"])
+            self.assertEqual(len(wordpress["upload_executables"]), 1)
+            titles = {item["title"] for item in result["findings"]}
+            self.assertIn(
+                "Executable PHP files present in WordPress uploads", titles
+            )
+            markdown = build_forensics_markdown(result)
+            html_report = build_forensics_html(result)
+            self.assertIn("Evidence intake and coverage", markdown)
+            self.assertIn("Response status and required actions", markdown)
+            self.assertIn("Methodology alignment", markdown)
+            self.assertIn("WordPress acquisition inventory", html_report)
+            validate_forensics_result(result)
+
 
 class SchemaTests(unittest.TestCase):
     def test_valid_result_passes(self):

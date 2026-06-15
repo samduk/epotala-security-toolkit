@@ -22,6 +22,7 @@ integrity verification, or analyst review.
 - [External Assessment Controls](#external-assessment-controls)
 - [Optional CVE Correlation](#optional-cve-correlation)
 - [Workflow B: Incident Evidence Analysis](#workflow-b-incident-evidence-analysis)
+- [Full Incident Response Runbook](INCIDENT_RESPONSE_RUNBOOK.md)
 - [Command Reference](#command-reference)
 - [Exit Codes](#exit-codes)
 - [Troubleshooting](#troubleshooting)
@@ -33,7 +34,7 @@ integrity verification, or analyst review.
 | Program | Purpose | Network activity |
 |---|---|---|
 | **EPX Recon** (`epx-recon`) | Run an external, read-only website assessment | Yes, against the authorized target |
-| **EPX Forensics** (`epx-forensics`) | Analyze supplied logs, archives, PHP files, configuration, and SQL | No |
+| **EPX Forensics** (`epx-forensics`) | Analyze web/auth logs, full WordPress projects, archives, configuration, and SQL | No |
 | **EPX Report** (`epx-report`) | Convert a scan or forensic JSON artifact into Markdown or HTML | No |
 | **EPX Verify** (`epx-verify`) | Verify an artifact's SHA-256 sidecar and validate JSON schemas | No |
 
@@ -480,220 +481,48 @@ CVE interpretation rules:
 
 ## Workflow B: Incident Evidence Analysis
 
-Use this workflow when a client supplies access logs, suspicious server files,
-configuration files, or a database dump.
+Use the canonical [EPX WordPress Incident Response Runbook](INCIDENT_RESPONSE_RUNBOOK.md)
+when a client supplies a complete WordPress project, web or authentication
+logs, archives, configuration, or a database dump. It covers intake,
+chain-of-custody records, acquisition completeness, analysis, timeline
+correlation, containment, recovery, peer review, notification considerations,
+delivery, and closure.
 
-`epx-forensics` performs offline static analysis. It does not contact the
-affected website and does not execute supplied PHP.
+The minimum happy path is:
 
-### B1. Receive and Preserve Evidence
+1. Preserve received evidence in `originals/`.
+2. Hash the originals and create a verified `working/` copy.
+3. Record receipt metadata, source timezone, collection method, and known gaps.
+4. Run `epx-forensics` against the working copy.
+5. Verify the JSON artifact and inspect `status`, `errors`, and `coverage`.
+6. Validate findings, WordPress inventory, authentication events, SQL matches,
+   and every timeline timestamp against original evidence.
+7. Record approved containment, eradication, recovery, and notification
+   decisions.
+8. Generate an automated draft, complete peer review, regenerate with
+   `--reviewed-by`, and verify the final report.
 
-1. Record who supplied the evidence, when it was received, and by which channel.
-2. Record the incident or ticket reference.
-3. Preserve the original files in a restricted, read-only location.
-4. Analyze a working copy, not the only available original.
-5. Do not manually extract or execute suspicious archives or scripts.
-6. Record any known source timezone and collection method.
-
-Example case structure:
-
-```text
-cases/IR-CLIENT-2026-001/
-|-- originals/
-|-- working/
-|   |-- accesslogs/
-|   |   |-- access.log
-|   |   `-- older-access.log.gz
-|   |-- suspicious.php
-|   `-- database.sql
-`-- reports/
-```
-
-The analyzer accepts a single file or a folder. Supported archive formats are:
-
-- `.gz`;
-- `.zip`;
-- `.tar`;
-- `.tar.gz`;
-- `.tgz`.
-
-Archive safety limits:
-
-| Limit | Value |
-|---|---:|
-| Maximum regular-file members | 5,000 |
-| Maximum expanded member size | 100 MB |
-| Maximum total expanded archive size | 500 MB |
-
-Archives are read without extracting members to disk. Parent traversal paths,
-links, and device entries are rejected.
-
-### B2. Name Access Logs Clearly
-
-Use recognizable access-log names or place logs in an `accesslogs` directory.
-Examples:
-
-```text
-access.log
-access.log.gz
-client-accesslog.zip
-client-ssl_log
-accesslogs/client.example
-```
-
-The parser expects Apache combined-style access-log records. Malformed or
-unsupported lines are counted and reported rather than silently treated as
-valid.
-
-### B3. Run Offline Analysis
-
-From the tool directory:
+Example analysis command:
 
 ```bash
-./epx-forensics ../cases/IR-CLIENT-2026-001/working \
-  --case-id IR-CLIENT-2026-001 \
-  --site client.example \
-  --authorization-ref INCIDENT-TICKET-2026-001 \
+./epx-forensics "$CASE_ROOT/working" \
+  --case-id "IR-CLIENT-2026-001" \
+  --site "client.example" \
+  --authorization-ref "INCIDENT-TICKET-2026-001" \
   --operator "Analyst Name" \
   --client "Client Organization" \
-  --output reports/IR-CLIENT-2026-001-forensics.json
+  --received-at "2026-06-14T10:30:00+05:30" \
+  --received-from "Client Contact" \
+  --collection-method "Encrypted client transfer" \
+  --source-timezone "Asia/Kolkata" \
+  --originals-preserved \
+  --incident-state active \
+  --output "$CASE_ROOT/reports/IR-CLIENT-2026-001-forensics.json"
 ```
 
-The command creates:
-
-```text
-reports/IR-CLIENT-2026-001-forensics.json
-reports/IR-CLIENT-2026-001-forensics.json.sha256
-```
-
-The analyzer records:
-
-- hashes, sizes, paths, types, and modification times for supplied sources;
-- safe archive-member metadata;
-- duplicate log content;
-- parsed and malformed log counts;
-- login attacks and high-volume PHP probing;
-- likely nonbaseline backdoor interactions;
-- static PHP and server-configuration indicators;
-- conservative SQL injection pattern results;
-- timeline events, indicators, findings, and limitations.
-
-### B4. Check Processing Status
-
-Open the forensic JSON and review `status` and `errors`.
-
-| JSON status | Meaning | Required action |
-|---|---|---|
-| `complete` | All accepted evidence was processed | Continue |
-| `incomplete` | Some evidence could not be processed | Investigate every error |
-| `failed` | Analysis could not be completed | Correct the source or command |
-
-`epx-forensics` returns exit code 0 for `complete` and `incomplete`, so the
-operator must review the JSON status. It returns exit code 1 for `failed`.
-
-### B5. Verify the Forensic Artifact
-
-```bash
-./epx-verify reports/IR-CLIENT-2026-001-forensics.json
-```
-
-Do not continue after a mismatch, missing sidecar, or schema error.
-
-### B6. Perform Incident Analyst Review
-
-Review:
-
-- the evidence manifest and every SHA-256 value;
-- source and archive-member paths;
-- processing errors and parser statistics;
-- duplicate evidence counts;
-- the compromise assessment;
-- initial-access and database-injection assessments;
-- every finding's severity and confidence;
-- every timeline event and its `timestamp_basis`;
-- indicators, source IPs, URL paths, and file hashes;
-- whether response sizes represent real content or a soft-404 baseline;
-- whether filesystem times came from the affected server or a copied file;
-- SQL matches in their original database context.
-
-Do not make unsupported claims:
-
-- access logs show requests and responses, not command output;
-- HTTP 200 does not always mean a requested file existed;
-- login attempts do not prove successful authentication;
-- filesystem modification times can be copied or altered;
-- a suspicious filename alone does not prove malware;
-- no SQL pattern match does not prove the database is clean;
-- available logs may begin after initial compromise.
-
-### B7. Generate an Incident Draft
-
-Markdown:
-
-```bash
-./epx-report reports/IR-CLIENT-2026-001-forensics.json \
-  --format md \
-  --output reports/IR-CLIENT-2026-001-incident-report.md \
-  --client-name "Client Organization" \
-  --report-id IR-CLIENT-2026-001
-```
-
-HTML:
-
-```bash
-./epx-report reports/IR-CLIENT-2026-001-forensics.json \
-  --format html \
-  --output reports/IR-CLIENT-2026-001-incident-report.html \
-  --client-name "Client Organization" \
-  --report-id IR-CLIENT-2026-001
-```
-
-The draft remains marked for analyst review.
-
-### B8. Generate the Reviewed Incident Report
-
-Only after completing the incident review:
-
-```bash
-./epx-report reports/IR-CLIENT-2026-001-forensics.json \
-  --format html \
-  --output reports/IR-CLIENT-2026-001-incident-report.html \
-  --client-name "Client Organization" \
-  --reviewed-by "Analyst Name" \
-  --report-id IR-CLIENT-2026-001
-```
-
-### B9. Verify and Inspect the Final Report
-
-```bash
-./epx-verify reports/IR-CLIENT-2026-001-incident-report.md
-./epx-verify reports/IR-CLIENT-2026-001-incident-report.html
-```
-
-Before delivery, confirm:
-
-- timestamps include their timezone or UTC offset;
-- timestamp limitations are visible;
-- attempts and confirmed activity are clearly separated;
-- initial access is not guessed;
-- sensitive database records, credentials, tokens, and personal data are absent;
-- indicators are appropriate to share with the client;
-- recommendations match the evidence and incident severity.
-
-### B10. Preserve the Case Package
-
-The internal forensic package should contain:
-
-```text
-IR-CLIENT-2026-001-forensics.json
-IR-CLIENT-2026-001-forensics.json.sha256
-IR-CLIENT-2026-001-incident-report.html
-IR-CLIENT-2026-001-incident-report.html.sha256
-```
-
-Retain the original evidence separately according to the contract and
-chain-of-custody procedure. Do not place client evidence in this source
-repository.
+`epx-forensics` is offline. It does not contact the affected website and does
+not execute supplied PHP. Use `--originals-preserved` only when it is true, and
+use `--incident-state unknown` when the state has not been confirmed.
 
 ## Command Reference
 
@@ -730,7 +559,20 @@ Important options:
   --operator NAME --client CLIENT --output RESULT.json
 ```
 
-All options except `--site` are required.
+Required inputs are `SOURCE`, `--output`, `--case-id`,
+`--authorization-ref`, `--operator`, and `--client`.
+
+Important options:
+
+| Option | Meaning |
+|---|---|
+| `--site` | Affected hostname or site |
+| `--received-at` | ISO-8601 evidence receipt time |
+| `--received-from` | Person, team, or system that supplied evidence |
+| `--collection-method` | How evidence was collected or transferred |
+| `--source-timezone` | Source timezone such as `+05:30` or `Asia/Kolkata` |
+| `--originals-preserved` | Confirm originals are separately preserved |
+| `--incident-state` | `unknown`, `active`, `contained`, `eradicated`, or `recovered` |
 
 ### `epx-report`
 
@@ -918,6 +760,7 @@ This runs:
 
 Related documents:
 
+- [INCIDENT_RESPONSE_RUNBOOK.md](INCIDENT_RESPONSE_RUNBOOK.md)
 - [CHANGELOG.md](CHANGELOG.md)
 - [SECURITY.md](SECURITY.md)
 - [LICENSE.md](LICENSE.md)

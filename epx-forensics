@@ -19,8 +19,8 @@ def main():
     parser = argparse.ArgumentParser(
         prog="epx-forensics",
         description=(
-            "EPX Forensics: analyze access logs, supported archives, PHP "
-            "artifacts, and SQL dumps offline."
+            "EPX Forensics: analyze web and authentication logs, supported "
+            "archives, WordPress projects, PHP artifacts, and SQL dumps offline."
         ),
     )
     parser.add_argument("source", help="Evidence file or folder")
@@ -36,6 +36,22 @@ def main():
                         help="Analyst running the evidence analysis")
     parser.add_argument("--client", required=True,
                         help="Client or organization name")
+    parser.add_argument("--received-at", default="",
+                        help="ISO-8601 evidence receipt time")
+    parser.add_argument("--received-from", default="",
+                        help="Person, team, or system that supplied the evidence")
+    parser.add_argument("--collection-method", default="",
+                        help="How the evidence was collected or transferred")
+    parser.add_argument("--source-timezone", default="",
+                        help="Source-system timezone, e.g. +09:00 or Asia/Kolkata")
+    parser.add_argument("--originals-preserved", action="store_true",
+                        help="Confirm originals are preserved separately")
+    parser.add_argument(
+        "--incident-state",
+        choices=("unknown", "active", "contained", "eradicated", "recovered"),
+        default="unknown",
+        help="Current incident state recorded by the operator (default: unknown)",
+    )
     parser.add_argument("--version", action="version",
                         version=SHORT_NAME + " " + __version__)
     args = parser.parse_args()
@@ -47,6 +63,12 @@ def main():
         authorization_reference=args.authorization_ref,
         operator=args.operator,
         client=args.client,
+        received_at=args.received_at,
+        received_from=args.received_from,
+        collection_method=args.collection_method,
+        source_timezone=args.source_timezone,
+        originals_preserved=args.originals_preserved,
+        incident_state=args.incident_state,
     )
     try:
         validate_forensics_result(result)

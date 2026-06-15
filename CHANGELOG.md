@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Added a canonical WordPress incident-response runbook covering evidence
+  preservation, acquisition completeness, analysis, containment, recovery,
+  peer review, delivery, notification considerations, and case closure.
+- Expanded EPX Forensics schema `1.1` with evidence receipt metadata,
+  authentication-log analysis, WordPress project inventory, evidence coverage,
+  technical severity, incident state, response-phase ownership, required
+  follow-up, and standards-informed methodology sections.
+- Expanded incident reports with evidence coverage, WordPress inventory,
+  response status, timestamp basis, methodology references, and bounded
+  evidence-manifest display. Schema `1.0` artifacts remain readable.
 - Adopted the product name **ePotala Security Toolkit**, shortened to
   **EPX Toolkit**, with the component names EPX Recon, EPX Forensics,
   EPX Report, and EPX Verify. Existing command names remain unchanged.

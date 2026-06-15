@@ -11,9 +11,10 @@ import uuid
 import zipfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import __version__
 
@@ -22,6 +23,7 @@ MAX_TOTAL_ARCHIVE_BYTES = 500 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 5000
 MAX_STATIC_BYTES = 2 * 1024 * 1024
 MAX_LINE_BYTES = 256 * 1024
+FORENSICS_SCHEMA_VERSION = "1.1"
 
 LOG_PATTERN = re.compile(
     rb'^(?P<ip>\S+) \S+ \S+ \[(?P<time>[^\]]+)\] '
@@ -38,6 +40,90 @@ SHELL_NAME_PATTERN = re.compile(
     r"(?i)(?:^|/)(?:x|wso|shell|cmd|bypass|uploader|upload|mini|alfa|"
     r"priv8|marijuana|fox|wp-console|filemanager)[^/]*\.p(?:hp[0-9]?|html)$"
 )
+AUTH_FAILED_PATTERN = re.compile(
+    r"(?i)failed password for (?:invalid user )?(?P<user>\S+) "
+    r"from (?P<ip>[0-9a-f:.]+)"
+)
+AUTH_ACCEPTED_PATTERN = re.compile(
+    r"(?i)accepted (?P<method>\S+) for (?P<user>\S+) "
+    r"from (?P<ip>[0-9a-f:.]+)"
+)
+AUTH_USERADD_PATTERN = re.compile(
+    r"(?i)(?:new user: name=|useradd(?:\[[0-9]+\])?:.*new user: name=)"
+    r"(?P<user>[a-z0-9._-]+)"
+)
+RFC3164_PATTERN = re.compile(
+    r"^(?P<month>[A-Z][a-z]{2})\s+(?P<day>[ 0-9][0-9])\s+"
+    r"(?P<clock>[0-9]{2}:[0-9]{2}:[0-9]{2})"
+)
+ISO_SYSLOG_PATTERN = re.compile(
+    r"^(?P<time>[0-9]{4}-[0-9]{2}-[0-9]{2}T"
+    r"[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2}))"
+)
+
+METHODOLOGY = [
+    {
+        "framework": "NIST SP 800-61 Rev. 3 and NIST CSF 2.0",
+        "application": (
+            "Evidence analysis supports Detect and Respond outcomes. The report "
+            "tracks containment, eradication, recovery, and improvement as separate "
+            "human-owned activities."
+        ),
+        "reference": "https://doi.org/10.6028/NIST.SP.800-61r3",
+    },
+    {
+        "framework": "CISA Federal Incident Response Playbooks",
+        "application": (
+            "The workflow preserves evidence, establishes scope, records findings "
+            "and status, and separates analysis from containment and recovery."
+        ),
+        "reference": (
+            "https://www.cisa.gov/resources-tools/resources/"
+            "federal-government-cybersecurity-incident-and-vulnerability-response-playbooks"
+        ),
+    },
+    {
+        "framework": "CISA chain-of-custody guidance",
+        "application": (
+            "Source hashes, paths, sizes, modification times, receipt metadata, and "
+            "original-preservation status are recorded for evidence accountability."
+        ),
+        "reference": (
+            "https://www.cisa.gov/resources-tools/resources/"
+            "cisa-insights-chain-custody-and-critical-infrastructure-systems"
+        ),
+    },
+    {
+        "framework": "CISA incident reporting guidance",
+        "application": (
+            "The report captures facts useful for notification, but legal, regulatory, "
+            "contractual, and CISA reporting obligations require case-specific review."
+        ),
+        "reference": "https://www.cisa.gov/reporting-cyber-incident",
+    },
+    {
+        "framework": "Legacy US-CERT Federal Incident Notification Guidelines",
+        "application": (
+            "Notification data elements are retained as a useful reference where "
+            "federal or contract-specific reporting requirements apply."
+        ),
+        "reference": (
+            "https://www.cisa.gov/federal-incident-notification-guidelines"
+        ),
+    },
+    {
+        "framework": "Hyperscale incident-response practices",
+        "application": (
+            "The workflow uses explicit ownership, do-no-harm evidence handling, "
+            "targeted analysis, automation with human validation, known-good recovery, "
+            "and post-incident improvement practices reflected in AWS, Microsoft, "
+            "Google, Netflix, and Meta engineering guidance."
+        ),
+        "reference": (
+            "https://docs.aws.amazon.com/security-ir/latest/userguide/introduction.html"
+        ),
+    },
+]
 
 
 def utc_now():
@@ -305,6 +391,84 @@ def parse_log_time(raw):
     return datetime.strptime(raw, "%d/%b/%Y:%H:%M:%S %z")
 
 
+def is_auth_log_name(name):
+    """Return True for common Linux authentication log names."""
+    lower = name.lower().replace("\\", "/")
+    basename = lower.rsplit("/", 1)[-1]
+    return (
+        basename.startswith("auth.log") or
+        basename.startswith("secure") or
+        basename.startswith("messages") or
+        basename.startswith("journal") or
+        "authlog" in basename
+    )
+
+
+def is_access_log_name(name):
+    """Return True for common web access log names, excluding auth logs."""
+    lower = name.lower()
+    if is_auth_log_name(lower):
+        return False
+    return (
+        "accesslog" in lower or "access.log" in lower or
+        "ssl_log" in lower or lower.endswith((".log", "_log"))
+    )
+
+
+def parse_source_timezone(value):
+    """Return a timezone and a note for operator-supplied source timezone text."""
+    text = (value or "").strip()
+    if not text:
+        return timezone.utc, "source timezone not supplied; UTC assumed"
+    if text.upper() in ("UTC", "Z"):
+        return timezone.utc, "source timezone supplied as UTC"
+    match = re.fullmatch(r"([+-])([0-9]{2}):([0-9]{2})", text)
+    if match:
+        minutes = int(match.group(2)) * 60 + int(match.group(3))
+        if match.group(1) == "-":
+            minutes = -minutes
+        return timezone(timedelta(minutes=minutes)), "source timezone " + text
+    try:
+        return ZoneInfo(text), "source timezone " + text
+    except ZoneInfoNotFoundError:
+        return timezone.utc, (
+            "unrecognized source timezone '" + text + "'; UTC assumed"
+        )
+
+
+def parse_auth_time(line, item, timezone_text):
+    """Parse ISO or traditional syslog timestamps from an authentication log."""
+    iso_match = ISO_SYSLOG_PATTERN.match(line)
+    if iso_match:
+        try:
+            return (
+                datetime.fromisoformat(
+                    iso_match.group("time").replace("Z", "+00:00")
+                ),
+                "Authentication log ISO-8601 timestamp",
+            )
+        except ValueError:
+            pass
+    traditional = RFC3164_PATTERN.match(line)
+    if not traditional:
+        return None, ""
+    try:
+        item_time = datetime.fromisoformat(item.modified_at.replace("Z", "+00:00"))
+        tzinfo, timezone_note = parse_source_timezone(timezone_text)
+        parsed = datetime.strptime(
+            str(item_time.year) + " " + traditional.group("month") + " " +
+            traditional.group("day").strip() + " " + traditional.group("clock"),
+            "%Y %b %d %H:%M:%S",
+        ).replace(tzinfo=tzinfo)
+        return (
+            parsed,
+            "Authentication log local timestamp; year inferred from evidence "
+            "modification time; " + timezone_note,
+        )
+    except ValueError:
+        return None, ""
+
+
 def suspicious_php_path(path):
     """Identify paths commonly used for web shells or hidden PHP loaders."""
     lower = path.lower()
@@ -347,10 +511,7 @@ def analyze_logs(items):
     duplicates = 0
     for item in items:
         lower = item.name.lower()
-        if not (
-            "accesslog" in lower or "access.log" in lower or
-            "ssl_log" in lower or lower.endswith((".log", "_log"))
-        ):
+        if not is_access_log_name(lower):
             continue
         if item.sha256 in seen_content:
             duplicates += 1
@@ -584,6 +745,302 @@ def analyze_logs(items):
     return findings, events, indicators, stats, duplicates
 
 
+def analyze_auth_logs(items, timezone_text=""):
+    """Analyze Linux authentication logs for SSH and account activity."""
+    failed = defaultdict(list)
+    accepted = []
+    created_users = []
+    source_ids = []
+    seen_content = set()
+    duplicates = 0
+    stats = {
+        "auth_log_lines": 0,
+        "parsed_auth_log_lines": 0,
+        "malformed_auth_log_lines": 0,
+    }
+    for item in items:
+        if not is_auth_log_name(item.name):
+            continue
+        if item.sha256 in seen_content:
+            duplicates += 1
+            continue
+        seen_content.add(item.sha256)
+        source_ids.append(item.reference)
+        with item.open() as handle:
+            for line_number, raw_line, oversized in iter_bounded_lines(handle):
+                stats["auth_log_lines"] += 1
+                if oversized:
+                    stats["malformed_auth_log_lines"] += 1
+                    continue
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                timestamp, basis = parse_auth_time(line, item, timezone_text)
+                failed_match = AUTH_FAILED_PATTERN.search(line)
+                accepted_match = AUTH_ACCEPTED_PATTERN.search(line)
+                useradd_match = AUTH_USERADD_PATTERN.search(line)
+                if not (failed_match or accepted_match or useradd_match):
+                    continue
+                if timestamp is None:
+                    stats["malformed_auth_log_lines"] += 1
+                    continue
+                event = {
+                    "timestamp": timestamp,
+                    "basis": basis,
+                    "source": item.reference,
+                    "line": line_number,
+                }
+                if failed_match:
+                    event.update(failed_match.groupdict())
+                    failed[event["ip"]].append(event)
+                elif accepted_match:
+                    event.update(accepted_match.groupdict())
+                    accepted.append(event)
+                elif useradd_match:
+                    event.update(useradd_match.groupdict())
+                    created_users.append(event)
+                stats["parsed_auth_log_lines"] += 1
+
+    findings = []
+    events = []
+    indicators = []
+    brute_sources = []
+    for ip_address, attempts in failed.items():
+        if len(attempts) < 20:
+            continue
+        attempts.sort(key=lambda item: item["timestamp"])
+        brute_sources.append((ip_address, attempts))
+        events.append({
+            "timestamp": attempts[0]["timestamp"],
+            "timestamp_basis": attempts[0]["basis"],
+            "category": "Credential Access",
+            "source_ip": ip_address,
+            "action": "High-volume failed SSH authentication",
+            "outcome": "Attempted; successful authentication is not established",
+            "confidence": "High",
+            "summary": (
+                str(len(attempts)) + " failed SSH logins were recorded between " +
+                attempts[0]["timestamp"].isoformat() + " and " +
+                attempts[-1]["timestamp"].isoformat() + "."
+            ),
+            "evidence_refs": sorted({item["source"] for item in attempts}),
+        })
+        indicators.append({
+            "type": "IP address",
+            "value": ip_address,
+            "context": "High-volume failed SSH authentication",
+            "confidence": "High",
+        })
+    if brute_sources:
+        findings.append(finding(
+            "Automated SSH authentication attacks",
+            "Medium", "High", "Credential Access",
+            str(sum(len(items) for _, items in brute_sources)) +
+            " failed SSH authentication events came from " +
+            str(len(brute_sources)) + " high-volume source(s).",
+            [
+                ip + ": " + str(len(attempts)) + " failed authentication events"
+                for ip, attempts in sorted(
+                    brute_sources, key=lambda item: len(item[1]), reverse=True
+                )[:20]
+            ],
+            source_ids,
+            "Password guessing can compromise weak, reused, or exposed credentials.",
+            "Validate exposed accounts, rotate affected credentials, enforce key-based "
+            "access and MFA where supported, and restrict administrative network access.",
+        ))
+
+    suspicious_successes = []
+    for event_number, event in enumerate(
+        sorted(accepted, key=lambda item: item["timestamp"]), start=1
+    ):
+        prior_failures = [
+            item for item in failed.get(event["ip"], [])
+            if item["timestamp"] <= event["timestamp"]
+        ]
+        suspicious = event["user"] == "root" or len(prior_failures) >= 5
+        if event_number <= 200:
+            events.append({
+                "timestamp": event["timestamp"],
+                "timestamp_basis": event["basis"],
+                "category": "Authentication",
+                "source_ip": event["ip"],
+                "action": "Successful SSH authentication for " + event["user"],
+                "outcome": (
+                    "Accepted " + event["method"] +
+                    "; authorization not determined"
+                ),
+                "confidence": "Confirmed",
+                "summary": (
+                    "Authentication-log event at line " + str(event["line"]) +
+                    (" followed " + str(len(prior_failures)) + " earlier failures"
+                     if prior_failures else "")
+                ),
+                "evidence_refs": [event["source"]],
+            })
+        if suspicious:
+            suspicious_successes.append((event, len(prior_failures)))
+            indicators.append({
+                "type": "IP address",
+                "value": event["ip"],
+                "context": "Successful SSH authentication requiring validation",
+                "confidence": "High",
+            })
+    if suspicious_successes:
+        findings.append(finding(
+            "Successful SSH authentication requires validation",
+            "High", "High", "Initial Access",
+            "Authentication logs contain root access or successful SSH authentication "
+            "from a source that generated repeated prior failures.",
+            [
+                item["timestamp"].isoformat() + " " + item["ip"] + " -> " +
+                item["user"] + " via " + item["method"] + "; prior failures: " +
+                str(prior_failures)
+                for item, prior_failures in suspicious_successes[:30]
+            ],
+            [item["source"] for item, _ in suspicious_successes],
+            "An unauthorized successful remote login can provide direct server access.",
+            "Confirm each event with the system owner, review session and command "
+            "history, rotate affected credentials, and investigate persistence.",
+        ))
+
+    if created_users:
+        for event in created_users[:50]:
+            events.append({
+                "timestamp": event["timestamp"],
+                "timestamp_basis": event["basis"],
+                "category": "Persistence",
+                "source_ip": "",
+                "action": "Local account creation recorded",
+                "outcome": "User " + event["user"] + " created; authorization unknown",
+                "confidence": "Confirmed",
+                "summary": "Authentication-log event at line " + str(event["line"]),
+                "evidence_refs": [event["source"]],
+            })
+        findings.append(finding(
+            "Local account creation requires validation",
+            "High", "Medium", "Persistence",
+            "Authentication logs record local account creation during the supplied "
+            "evidence period.",
+            [
+                item["timestamp"].isoformat() + " user " + item["user"]
+                for item in created_users[:30]
+            ],
+            [item["source"] for item in created_users],
+            "An unauthorized local account can provide persistent server access.",
+            "Validate each account with change records and remove unauthorized accounts "
+            "only after preserving evidence and identifying dependent access.",
+        ))
+    return findings, events, indicators, stats, duplicates
+
+
+def normalized_evidence_path(name):
+    """Return a slash-normalized evidence path without a leading dot or slash."""
+    return name.replace("\\", "/").lstrip("./")
+
+
+def analyze_wordpress_acquisition(items):
+    """Inventory a supplied WordPress project and flag executable uploads."""
+    paths = []
+    wordpress_files = 0
+    plugins = set()
+    themes = set()
+    upload_executables = []
+    version = ""
+    version_source = ""
+    php_files = 0
+    for item in items:
+        path = normalized_evidence_path(item.name)
+        lower = path.lower()
+        padded = "/" + lower.strip("/") + "/"
+        paths.append((item, lower, padded))
+        basename = lower.rsplit("/", 1)[-1]
+        wordpress_related = (
+            "/wp-admin/" in padded or
+            "/wp-includes/" in padded or
+            "/wp-content/" in padded or
+            basename == "wp-config.php" or
+            basename in {
+                "index.php", "license.txt", "readme.html", "xmlrpc.php",
+                "wp-activate.php", "wp-blog-header.php", "wp-comments-post.php",
+                "wp-config-sample.php", "wp-cron.php", "wp-links-opml.php",
+                "wp-load.php", "wp-login.php", "wp-mail.php",
+                "wp-settings.php", "wp-signup.php", "wp-trackback.php",
+            }
+        )
+        if wordpress_related:
+            wordpress_files += 1
+        if wordpress_related and lower.endswith((".php", ".phtml", ".php5")):
+            php_files += 1
+        plugin_match = re.search(r"(?:^|/)wp-content/plugins/([^/]+)", lower)
+        if plugin_match:
+            plugins.add(plugin_match.group(1))
+        theme_match = re.search(r"(?:^|/)wp-content/themes/([^/]+)", lower)
+        if theme_match:
+            themes.add(theme_match.group(1))
+        if (
+            "/wp-content/uploads/" in padded and
+            lower.endswith((".php", ".phtml", ".php5"))
+        ):
+            upload_executables.append(item)
+        if lower.endswith("wp-includes/version.php") and not version:
+            with item.open() as handle:
+                text = static_excerpt(read_bounded(handle, MAX_STATIC_BYTES))
+            match = re.search(
+                r"\$wp_version\s*=\s*['\"](?P<version>[0-9][^'\"]*)['\"]",
+                text,
+            )
+            if match:
+                version = match.group("version")[:80]
+                version_source = item.reference
+
+    has_admin = any("/wp-admin/" in padded for _, _, padded in paths)
+    has_includes = any("/wp-includes/" in padded for _, _, padded in paths)
+    has_content = any("/wp-content/" in padded for _, _, padded in paths)
+    has_config = any(lower.endswith("wp-config.php") for _, lower, _ in paths)
+    detected = has_admin or has_includes or has_content or has_config
+    inventory = {
+        "detected": detected,
+        "files_total": wordpress_files if detected else 0,
+        "php_files": php_files if detected else 0,
+        "core_present": has_admin and has_includes,
+        "wp_admin_present": has_admin,
+        "wp_includes_present": has_includes,
+        "wp_content_present": has_content,
+        "wp_config_present": has_config,
+        "version": version,
+        "version_source": version_source,
+        "plugins": sorted(plugins),
+        "themes": sorted(themes),
+        "upload_executables": [
+            {
+                "path": item.name,
+                "sha256": item.sha256,
+                "source_id": item.reference,
+            }
+            for item in upload_executables[:100]
+        ],
+    }
+    findings = []
+    if upload_executables:
+        findings.append(finding(
+            "Executable PHP files present in WordPress uploads",
+            "High", "Medium", "Persistence",
+            str(len(upload_executables)) +
+            " PHP-capable file(s) were found below wp-content/uploads. Location "
+            "alone does not prove malicious intent, so each file requires review.",
+            [
+                item.name + " [" + item.sha256 + "]"
+                for item in upload_executables[:50]
+            ],
+            [item.reference for item in upload_executables],
+            "Executable files in a public upload directory are a common persistence "
+            "and web-shell location.",
+            "Compare every file with a trusted baseline, review ownership and access "
+            "logs, quarantine confirmed malicious files after preserving evidence, "
+            "and block script execution in upload directories.",
+        ))
+    return inventory, findings
+
+
 def static_excerpt(data):
     """Decode a bounded amount of evidence for static marker matching."""
     return data[:MAX_STATIC_BYTES].decode("utf-8", errors="replace")
@@ -761,6 +1218,160 @@ def analyze_sql(items):
     return findings, sql_lines, bool(suspicious)
 
 
+def build_evidence_coverage(items, wordpress):
+    """Summarize which core evidence areas were supplied for analysis."""
+    access_items = [item for item in items if is_access_log_name(item.name)]
+    auth_items = [item for item in items if is_auth_log_name(item.name)]
+    sql_items = [
+        item for item in items
+        if item.name.lower().endswith((".sql", ".sql.txt"))
+    ]
+    return [
+        {
+            "area": "Web access logs",
+            "status": "analyzed" if access_items else "not-provided",
+            "items": len(access_items),
+            "notes": "Apache combined-style records are supported.",
+        },
+        {
+            "area": "Authentication logs",
+            "status": "analyzed" if auth_items else "not-provided",
+            "items": len(auth_items),
+            "notes": "Linux SSH and local account events are supported.",
+        },
+        {
+            "area": "SQL database dump",
+            "status": "analyzed" if sql_items else "not-provided",
+            "items": len(sql_items),
+            "notes": "Static high-confidence content patterns are reviewed.",
+        },
+        {
+            "area": "WordPress core",
+            "status": (
+                "analyzed" if wordpress["core_present"] else
+                "partial" if (
+                    wordpress["wp_admin_present"] or
+                    wordpress["wp_includes_present"]
+                ) else "not-provided"
+            ),
+            "items": (
+                int(wordpress["wp_admin_present"]) +
+                int(wordpress["wp_includes_present"])
+            ),
+            "notes": "Presence is inventoried; trusted checksum comparison is manual.",
+        },
+        {
+            "area": "WordPress content",
+            "status": (
+                "analyzed" if wordpress["wp_content_present"] else "not-provided"
+            ),
+            "items": len(wordpress["plugins"]) + len(wordpress["themes"]),
+            "notes": "Plugins, themes, uploads, and PHP artifacts are inventoried.",
+        },
+        {
+            "area": "WordPress configuration",
+            "status": (
+                "analyzed" if wordpress["wp_config_present"] else "not-provided"
+            ),
+            "items": int(wordpress["wp_config_present"]),
+            "notes": "Presence is recorded; secrets are not reproduced in the report.",
+        },
+    ]
+
+
+def build_response_lifecycle(incident_state, originals_preserved):
+    """Record automated and operator-owned incident-response phase status."""
+    reached = {
+        "unknown": 0,
+        "active": 0,
+        "contained": 1,
+        "eradicated": 2,
+        "recovered": 3,
+    }.get(incident_state, 0)
+    return [
+        {
+            "phase": "Preparation and evidence preservation",
+            "status": "recorded" if originals_preserved else "needs-validation",
+            "owner": "Incident lead and evidence custodian",
+            "notes": (
+                "Operator confirmed separate preservation of originals."
+                if originals_preserved else
+                "Separate preservation of original evidence was not confirmed."
+            ),
+        },
+        {
+            "phase": "Detection and analysis",
+            "status": "automated-draft",
+            "owner": "Incident analyst",
+            "notes": "Tool output requires evidence-based analyst validation.",
+        },
+        {
+            "phase": "Containment",
+            "status": "operator-recorded" if reached >= 1 else "not-recorded",
+            "owner": "System owner and incident lead",
+            "notes": "Technical analysis does not perform containment.",
+        },
+        {
+            "phase": "Eradication",
+            "status": "operator-recorded" if reached >= 2 else "not-recorded",
+            "owner": "System owner",
+            "notes": "Removal and trusted rebuild must be independently verified.",
+        },
+        {
+            "phase": "Recovery",
+            "status": "operator-recorded" if reached >= 3 else "not-recorded",
+            "owner": "System owner and business owner",
+            "notes": "Service restoration and monitoring require owner approval.",
+        },
+        {
+            "phase": "Post-incident improvement",
+            "status": "pending",
+            "owner": "Incident lead and service owner",
+            "notes": "Complete a lessons-learned review after recovery.",
+        },
+    ]
+
+
+def build_follow_up(compromise, incident_state, coverage):
+    """Return essential human actions that remain after automated analysis."""
+    actions = [
+        "Validate every High and Critical finding against original evidence and "
+        "document false positives or analyst adjustments.",
+        "Correlate access, authentication, database, and filesystem timestamps in "
+        "one normalized timeline while retaining each timestamp basis.",
+        "Compare WordPress core, plugins, and themes with trusted vendor packages "
+        "or known-good backups before declaring the application clean.",
+        "Review legal, contractual, insurance, law-enforcement, and CISA reporting "
+        "obligations with the client's authorized decision-makers.",
+    ]
+    missing = [
+        item["area"] for item in coverage if item["status"] != "analyzed"
+    ]
+    if missing:
+        actions.insert(
+            0,
+            "Obtain or document the absence of: " + ", ".join(missing) + ".",
+        )
+    if compromise in ("confirmed", "likely") and incident_state in ("unknown", "active"):
+        actions.insert(
+            0,
+            "Contain affected systems and accounts using the approved incident plan; "
+            "preserve volatile and persistent evidence before destructive cleanup.",
+        )
+    actions.append(
+        "After eradication, restore from trusted sources, rotate exposed secrets from "
+        "a known-clean system, monitor for recurrence, and record lessons learned."
+    )
+    return actions
+
+
+def highest_severity(findings):
+    """Return the highest finding severity, or Info when no findings exist."""
+    order = ("Critical", "High", "Medium", "Low", "Info")
+    present = {item["severity"] for item in findings}
+    return next((severity for severity in order if severity in present), "Info")
+
+
 def normalize_events(events):
     """Sort timeline events and serialize datetimes."""
     events.sort(key=lambda item: item["timestamp"])
@@ -788,12 +1399,14 @@ def deduplicate_indicators(indicators):
 
 
 def run_forensics(source, case_id, site="", authorization_reference="",
-                  operator="", client=""):
+                  operator="", client="", received_at="", received_from="",
+                  collection_method="", source_timezone="",
+                  originals_preserved=False, incident_state="unknown"):
     """Analyze an evidence file or folder and return a forensic result."""
     started_at = utc_now()
     result = {
         "artifact_type": "forensics",
-        "schema_version": "1.0",
+        "schema_version": FORENSICS_SCHEMA_VERSION,
         "tool_version": __version__,
         "case_id": case_id or str(uuid.uuid4()),
         "status": "complete",
@@ -805,6 +1418,13 @@ def run_forensics(source, case_id, site="", authorization_reference="",
             "operator": operator,
             "client": client,
         },
+        "evidence_intake": {
+            "received_at": received_at,
+            "received_from": received_from,
+            "collection_method": collection_method,
+            "source_timezone": source_timezone,
+            "originals_preserved": originals_preserved,
+        },
         "scope": {
             "source": str(Path(source).resolve()),
             "mode": "offline-static-evidence-analysis",
@@ -815,15 +1435,37 @@ def run_forensics(source, case_id, site="", authorization_reference="",
             },
         },
         "sources": [],
+        "coverage": [],
+        "wordpress": {
+            "detected": False,
+            "files_total": 0,
+            "php_files": 0,
+            "core_present": False,
+            "wp_admin_present": False,
+            "wp_includes_present": False,
+            "wp_content_present": False,
+            "wp_config_present": False,
+            "version": "",
+            "version_source": "",
+            "plugins": [],
+            "themes": [],
+            "upload_executables": [],
+        },
         "findings": [],
         "timeline": [],
         "assessment": {
             "compromise_status": "undetermined",
             "initial_access": "undetermined",
             "database_injection": "undetermined",
+            "technical_severity": "Info",
+            "incident_state": incident_state,
+            "business_impact": "Not assessed from supplied technical evidence.",
             "summary": "",
             "limitations": [],
         },
+        "response_lifecycle": [],
+        "required_follow_up": [],
+        "methodology": METHODOLOGY,
         "indicators": [],
         "statistics": {},
         "errors": [],
@@ -836,12 +1478,23 @@ def run_forensics(source, case_id, site="", authorization_reference="",
         log_findings, log_events, log_indicators, log_stats, duplicates = (
             analyze_logs(items)
         )
+        auth_findings, auth_events, auth_indicators, auth_stats, auth_duplicates = (
+            analyze_auth_logs(items, source_timezone)
+        )
+        wordpress, wordpress_findings = analyze_wordpress_acquisition(items)
+        result["wordpress"] = wordpress
+        result["coverage"] = build_evidence_coverage(items, wordpress)
         file_findings, file_events, file_indicators = analyze_server_files(items)
         sql_findings, sql_lines, sql_suspicious = analyze_sql(items)
-        result["findings"] = file_findings + log_findings + sql_findings
-        result["timeline"] = normalize_events(file_events + log_events)
+        result["findings"] = (
+            file_findings + wordpress_findings + log_findings +
+            auth_findings + sql_findings
+        )
+        result["timeline"] = normalize_events(
+            file_events + log_events + auth_events
+        )
         result["indicators"] = deduplicate_indicators(
-            file_indicators + log_indicators
+            file_indicators + log_indicators + auth_indicators
         )
 
         confirmed_malware = any(
@@ -852,10 +1505,17 @@ def run_forensics(source, case_id, site="", authorization_reference="",
             "likely" if any(item["category"] == "Execution"
                             for item in log_findings) else "undetermined"
         )
+        suspicious_auth = any(
+            item["title"] == "Successful SSH authentication requires validation"
+            for item in auth_findings
+        )
         result["assessment"] = {
             "compromise_status": compromise,
-            "initial_access": "undetermined",
+            "initial_access": "possible" if suspicious_auth else "undetermined",
             "database_injection": "possible" if sql_suspicious else "not-found",
+            "technical_severity": highest_severity(result["findings"]),
+            "incident_state": incident_state,
+            "business_impact": "Not assessed from supplied technical evidence.",
             "summary": (
                 "Server compromise is confirmed by supplied malicious artifacts."
                 if compromise == "confirmed" else
@@ -868,6 +1528,15 @@ def run_forensics(source, case_id, site="", authorization_reference="",
                 "successful authentication.",
                 "Filesystem modification times can be copied, altered, or changed during "
                 "evidence collection.",
+                "No trusted WordPress core, plugin, or theme checksum comparison was "
+                "performed; presence and static indicators are not proof of integrity.",
+                (
+                    "Traditional authentication-log years are inferred from evidence "
+                    "modification time and the operator-supplied source timezone."
+                    if auth_stats["parsed_auth_log_lines"] else
+                    "No supported authentication events were parsed from the supplied "
+                    "evidence."
+                ),
                 (
                     "No high-confidence stored script or PHP injection pattern was found "
                     "in the SQL dump; this is not proof that every record is clean."
@@ -876,14 +1545,25 @@ def run_forensics(source, case_id, site="", authorization_reference="",
                 ),
             ],
         }
+        result["response_lifecycle"] = build_response_lifecycle(
+            incident_state, originals_preserved
+        )
+        result["required_follow_up"] = build_follow_up(
+            compromise, incident_state, result["coverage"]
+        )
         result["statistics"] = {
             "source_files": len(manifests),
             "archive_members": sum(len(item["members"]) for item in manifests),
-            "duplicate_items": duplicates,
+            "duplicate_items": duplicates + auth_duplicates,
             "log_lines": log_stats["log_lines"],
             "parsed_log_lines": log_stats["parsed_log_lines"],
             "malformed_log_lines": log_stats["malformed_log_lines"],
+            "auth_log_lines": auth_stats["auth_log_lines"],
+            "parsed_auth_log_lines": auth_stats["parsed_auth_log_lines"],
+            "malformed_auth_log_lines": auth_stats["malformed_auth_log_lines"],
             "sql_lines": sql_lines,
+            "wordpress_files": wordpress["files_total"],
+            "php_files": wordpress["php_files"],
             "findings_total": len(result["findings"]),
             "timeline_events": len(result["timeline"]),
         }
@@ -899,7 +1579,12 @@ def run_forensics(source, case_id, site="", authorization_reference="",
             "log_lines": 0,
             "parsed_log_lines": 0,
             "malformed_log_lines": 0,
+            "auth_log_lines": 0,
+            "parsed_auth_log_lines": 0,
+            "malformed_auth_log_lines": 0,
             "sql_lines": 0,
+            "wordpress_files": 0,
+            "php_files": 0,
             "findings_total": 0,
             "timeline_events": 0,
         }

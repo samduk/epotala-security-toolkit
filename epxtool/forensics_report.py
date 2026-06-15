@@ -6,6 +6,8 @@ from .findings import SEVERITY_ORDER, count_by_severity, sort_findings
 from .forensics_schema import validate_forensics_result
 from .report import BRAND, SEVERITY_COLOR, evidence_block, markdown_table_text, markdown_text
 
+REPORT_MANIFEST_LIMIT = 200
+
 
 def state_label(value):
     """Make a stored assessment state readable."""
@@ -21,6 +23,9 @@ def build_forensics_markdown(result):
     report_id = context.get("report_id") or result["case_id"] + "-R1"
     findings = sort_findings(result["findings"])
     assessment = result["assessment"]
+    intake = result.get("evidence_intake", {})
+    coverage = result.get("coverage", [])
+    wordpress = result.get("wordpress", {})
     lines = [
         "# Incident Analysis: " + markdown_text(result["site"] or result["case_id"]),
         "",
@@ -67,6 +72,70 @@ def build_forensics_markdown(result):
         markdown_table_text(state_label(assessment["initial_access"])) + " |",
         "| Database injection | " +
         markdown_table_text(state_label(assessment["database_injection"])) + " |",
+        "| Technical severity | " +
+        markdown_table_text(assessment.get("technical_severity", "Not recorded")) + " |",
+        "| Current incident state | " +
+        markdown_table_text(state_label(
+            assessment.get("incident_state", "unknown")
+        )) + " |",
+        "| Business impact | " +
+        markdown_table_text(
+            assessment.get("business_impact", "Not assessed")
+        ) + " |",
+        "",
+        "## Evidence intake and coverage",
+        "",
+        "| Intake field | Recorded value |",
+        "|--------------|----------------|",
+        "| Received at | " +
+        markdown_table_text(intake.get("received_at") or "Not recorded") + " |",
+        "| Received from | " +
+        markdown_table_text(intake.get("received_from") or "Not recorded") + " |",
+        "| Collection method | " +
+        markdown_table_text(intake.get("collection_method") or "Not recorded") + " |",
+        "| Source timezone | " +
+        markdown_table_text(intake.get("source_timezone") or "Not recorded") + " |",
+        "| Originals preserved separately | " +
+        ("Yes" if intake.get("originals_preserved") else "Not confirmed") + " |",
+        "",
+        "| Evidence area | Status | Items | Notes |",
+        "|---------------|--------|------:|-------|",
+    ])
+    for item in coverage:
+        lines.append(
+            "| " + markdown_table_text(item["area"]) +
+            " | " + markdown_table_text(state_label(item["status"])) +
+            " | " + str(item["items"]) +
+            " | " + markdown_table_text(item["notes"]) + " |"
+        )
+    if not coverage:
+        lines.append("| Legacy artifact | Not recorded | 0 | Coverage unavailable |")
+    if wordpress.get("detected"):
+        lines.extend([
+            "",
+            "### WordPress acquisition inventory",
+            "",
+            "| Item | Result |",
+            "|------|--------|",
+            "| WordPress detected | " +
+            ("Yes" if wordpress["detected"] else "No") + " |",
+            "| Core directories present | " +
+            ("Yes" if wordpress["core_present"] else "No or partial") + " |",
+            "| Version observed | " +
+            markdown_table_text(wordpress["version"] or "Not determined") + " |",
+            "| PHP files inventoried | " + str(wordpress["php_files"]) + " |",
+            "| Plugins observed | " +
+            markdown_table_text(
+                ", ".join(wordpress["plugins"]) or "None observed"
+            ) + " |",
+            "| Themes observed | " +
+            markdown_table_text(
+                ", ".join(wordpress["themes"]) or "None observed"
+            ) + " |",
+            "| Executable upload files | " +
+            str(len(wordpress["upload_executables"])) + " |",
+        ])
+    lines.extend([
         "",
         "## Findings at a glance",
         "",
@@ -147,6 +216,48 @@ def build_forensics_markdown(result):
     if not result["indicators"]:
         lines.append("| - | - | No indicators generated | - |")
 
+    lifecycle = result.get("response_lifecycle", [])
+    lines.extend([
+        "",
+        "## Response status and required actions",
+        "",
+        "| Phase | Status | Owner | Notes |",
+        "|-------|--------|-------|-------|",
+    ])
+    for item in lifecycle:
+        lines.append(
+            "| " + markdown_table_text(item["phase"]) +
+            " | " + markdown_table_text(state_label(item["status"])) +
+            " | " + markdown_table_text(item["owner"]) +
+            " | " + markdown_table_text(item["notes"]) + " |"
+        )
+    if not lifecycle:
+        lines.append("| Not recorded | - | - | Legacy artifact |")
+    lines.extend(["", "**Required follow-up:**", ""])
+    for item in result.get("required_follow_up", []):
+        lines.append("- " + markdown_text(item))
+    if not result.get("required_follow_up"):
+        lines.append("- Complete analyst validation and response planning.")
+
+    lines.extend([
+        "",
+        "## Methodology alignment",
+        "",
+        "This report is informed by selected practices from the references below. "
+        "It is not a certification of compliance with any framework or organization.",
+        "",
+        "| Framework or practice | Application in this workflow | Reference |",
+        "|-----------------------|------------------------------|-----------|",
+    ])
+    for item in result.get("methodology", []):
+        lines.append(
+            "| " + markdown_table_text(item["framework"]) +
+            " | " + markdown_table_text(item["application"]) +
+            " | " + markdown_table_text(item["reference"]) + " |"
+        )
+    if not result.get("methodology"):
+        lines.append("| Not recorded | Legacy artifact | - |")
+
     lines.extend([
         "",
         "## Evidence manifest",
@@ -154,7 +265,7 @@ def build_forensics_markdown(result):
         "| ID | Supplied path | Type | Size | SHA-256 |",
         "|----|---------------|------|------|----------|",
     ])
-    for source in result["sources"]:
+    for source in result["sources"][:REPORT_MANIFEST_LIMIT]:
         lines.append(
             "| " + markdown_table_text(source["id"]) +
             " | " + markdown_table_text(source["path"]) +
@@ -162,11 +273,19 @@ def build_forensics_markdown(result):
             " | " + str(source["size"]) +
             " | `" + markdown_table_text(source["sha256"]) + "` |"
         )
+    if len(result["sources"]) > REPORT_MANIFEST_LIMIT:
+        lines.append(
+            "| ... | " + str(len(result["sources"]) - REPORT_MANIFEST_LIMIT) +
+            " additional source entries | - | - | See source JSON |"
+        )
     statistics = result["statistics"]
     lines.extend([
         "",
         "Parsed **" + str(statistics["parsed_log_lines"]) + "** of **" +
-        str(statistics["log_lines"]) + "** access-log lines and inspected **" +
+        str(statistics["log_lines"]) + "** access-log lines, parsed **" +
+        str(statistics.get("parsed_auth_log_lines", 0)) + "** supported events from **" +
+        str(statistics.get("auth_log_lines", 0)) +
+        "** authentication-log lines, and inspected **" +
         str(statistics["sql_lines"]) + "** SQL lines. Duplicate logical evidence "
         "items skipped: **" + str(statistics["duplicate_items"]) + "**.",
         "",
@@ -236,12 +355,13 @@ def build_forensics_html(result):
         )
     timeline_rows = "".join(
         "<tr><td>" + html.escape(event["timestamp"]) + "</td><td>" +
+        html.escape(event["timestamp_basis"]) + "</td><td>" +
         html.escape(event["source_ip"] or "Server evidence") + "</td><td>" +
         html.escape(event["action"]) + "</td><td>" +
         html.escape(event["outcome"]) + "</td><td>" +
         html.escape(event["confidence"]) + "</td></tr>"
         for event in result["timeline"]
-    ) or '<tr><td colspan="5">No timestamped events</td></tr>'
+    ) or '<tr><td colspan="6">No timestamped events</td></tr>'
     indicator_rows = "".join(
         "<tr><td>" + html.escape(item["type"]) + "</td><td><code>" +
         html.escape(item["value"]) + "</code></td><td>" +
@@ -254,8 +374,59 @@ def build_forensics_html(result):
         html.escape(item["path"]) + "</td><td>" + html.escape(item["kind"]) +
         "</td><td>" + str(item["size"]) + "</td><td><code>" +
         html.escape(item["sha256"]) + "</code></td></tr>"
-        for item in result["sources"]
+        for item in result["sources"][:REPORT_MANIFEST_LIMIT]
     )
+    if len(result["sources"]) > REPORT_MANIFEST_LIMIT:
+        source_rows += (
+            '<tr><td>...</td><td colspan="4">' +
+            str(len(result["sources"]) - REPORT_MANIFEST_LIMIT) +
+            " additional source entries are retained in the source JSON.</td></tr>"
+        )
+    intake = result.get("evidence_intake", {})
+    coverage_rows = "".join(
+        "<tr><td>" + html.escape(item["area"]) + "</td><td>" +
+        html.escape(state_label(item["status"])) + "</td><td>" +
+        str(item["items"]) + "</td><td>" + html.escape(item["notes"]) + "</td></tr>"
+        for item in result.get("coverage", [])
+    ) or '<tr><td colspan="4">Coverage was not recorded in this artifact.</td></tr>'
+    lifecycle_rows = "".join(
+        "<tr><td>" + html.escape(item["phase"]) + "</td><td>" +
+        html.escape(state_label(item["status"])) + "</td><td>" +
+        html.escape(item["owner"]) + "</td><td>" +
+        html.escape(item["notes"]) + "</td></tr>"
+        for item in result.get("response_lifecycle", [])
+    ) or '<tr><td colspan="4">Response status was not recorded.</td></tr>'
+    follow_up = "".join(
+        "<li>" + html.escape(item) + "</li>"
+        for item in result.get("required_follow_up", [])
+    ) or "<li>Complete analyst validation and response planning.</li>"
+    methodology_rows = "".join(
+        "<tr><td>" + html.escape(item["framework"]) + "</td><td>" +
+        html.escape(item["application"]) + '</td><td><a href="' +
+        html.escape(item["reference"], quote=True) + '">' +
+        html.escape(item["reference"]) + "</a></td></tr>"
+        for item in result.get("methodology", [])
+    ) or '<tr><td colspan="3">Methodology was not recorded.</td></tr>'
+    wordpress = result.get("wordpress", {})
+    wordpress_section = ""
+    if wordpress.get("detected"):
+        wordpress_section = (
+            "<h3>WordPress acquisition inventory</h3><table><tbody>"
+            "<tr><th>WordPress detected</th><td>" +
+            ("Yes" if wordpress["detected"] else "No") + "</td></tr>"
+            "<tr><th>Core directories present</th><td>" +
+            ("Yes" if wordpress["core_present"] else "No or partial") + "</td></tr>"
+            "<tr><th>Version observed</th><td>" +
+            html.escape(wordpress["version"] or "Not determined") + "</td></tr>"
+            "<tr><th>PHP files inventoried</th><td>" +
+            str(wordpress["php_files"]) + "</td></tr>"
+            "<tr><th>Plugins observed</th><td>" +
+            html.escape(", ".join(wordpress["plugins"]) or "None observed") +
+            "</td></tr><tr><th>Themes observed</th><td>" +
+            html.escape(", ".join(wordpress["themes"]) or "None observed") +
+            "</td></tr><tr><th>Executable upload files</th><td>" +
+            str(len(wordpress["upload_executables"])) + "</td></tr></tbody></table>"
+        )
     limitations = "".join(
         "<li>" + html.escape(item) + "</li>"
         for item in result["assessment"]["limitations"]
@@ -308,15 +479,44 @@ def build_forensics_html(result):
         html.escape(state_label(assessment["compromise_status"])) +
         " | Initial access: " + html.escape(state_label(assessment["initial_access"])) +
         " | Database injection: " +
-        html.escape(state_label(assessment["database_injection"])) + "</div>" +
+        html.escape(state_label(assessment["database_injection"])) +
+        " | Technical severity: " +
+        html.escape(assessment.get("technical_severity", "Not recorded")) +
+        " | Incident state: " +
+        html.escape(state_label(assessment.get("incident_state", "unknown"))) +
+        "<br>Business impact: " +
+        html.escape(assessment.get("business_impact", "Not assessed")) + "</div>" +
+        "<h2>Evidence intake and coverage</h2><table><tbody>"
+        "<tr><th>Received at</th><td>" +
+        html.escape(intake.get("received_at") or "Not recorded") + "</td></tr>"
+        "<tr><th>Received from</th><td>" +
+        html.escape(intake.get("received_from") or "Not recorded") + "</td></tr>"
+        "<tr><th>Collection method</th><td>" +
+        html.escape(intake.get("collection_method") or "Not recorded") + "</td></tr>"
+        "<tr><th>Source timezone</th><td>" +
+        html.escape(intake.get("source_timezone") or "Not recorded") + "</td></tr>"
+        "<tr><th>Originals preserved separately</th><td>" +
+        ("Yes" if intake.get("originals_preserved") else "Not confirmed") +
+        "</td></tr></tbody></table><table><thead><tr><th>Evidence area</th>"
+        "<th>Status</th><th>Items</th><th>Notes</th></tr></thead><tbody>" +
+        coverage_rows + "</tbody></table>" + wordpress_section +
         "<h2>Findings at a glance</h2><table><thead><tr><th>ID</th><th>Severity</th>"
         "<th>Confidence</th><th>Finding</th></tr></thead><tbody>" +
         finding_rows + "</tbody></table><h2>Detailed findings</h2>" + blocks +
-        "<h2>Incident timeline</h2><table><thead><tr><th>Time</th><th>Source</th>"
-        "<th>Activity</th><th>Outcome</th><th>Confidence</th></tr></thead><tbody>" +
+        "<h2>Incident timeline</h2><table><thead><tr><th>Time</th><th>Basis</th>"
+        "<th>Source</th><th>Activity</th><th>Outcome</th><th>Confidence</th>"
+        "</tr></thead><tbody>" +
         timeline_rows + "</tbody></table><h2>Indicators</h2><table><thead><tr>"
         "<th>Type</th><th>Value</th><th>Context</th><th>Confidence</th></tr></thead>"
-        "<tbody>" + indicator_rows + "</tbody></table><h2>Evidence manifest</h2>"
+        "<tbody>" + indicator_rows + "</tbody></table>"
+        "<h2>Response status and required actions</h2><table><thead><tr>"
+        "<th>Phase</th><th>Status</th><th>Owner</th><th>Notes</th></tr></thead>"
+        "<tbody>" + lifecycle_rows + "</tbody></table><h3>Required follow-up</h3><ul>" +
+        follow_up + "</ul><h2>Methodology alignment</h2><p>This report is informed "
+        "by selected practices from the references below. It is not a certification "
+        "of compliance with any framework or organization.</p><table><thead><tr>"
+        "<th>Framework or practice</th><th>Application</th><th>Reference</th></tr>"
+        "</thead><tbody>" + methodology_rows + "</tbody></table><h2>Evidence manifest</h2>"
         "<table><thead><tr><th>ID</th><th>Path</th><th>Type</th><th>Size</th>"
         "<th>SHA-256</th></tr></thead><tbody>" + source_rows +
         "</tbody></table><h2>Limitations</h2><ul>" + limitations + "</ul>" + errors +
