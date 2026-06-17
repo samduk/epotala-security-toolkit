@@ -115,6 +115,7 @@ flowchart TD
     M --> N[Write JSON and .sha256 sidecar]
 ```
 
+
 Important forensic properties:
 
 - Evidence is analyzed offline. Supplied code is read as data and is not
