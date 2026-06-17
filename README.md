@@ -15,6 +15,7 @@ integrity verification, or analyst review.
 ## Contents
 
 - [Programs](#programs)
+- [Architecture](#architecture)
 - [Mandatory Operating Rules](#mandatory-operating-rules)
 - [Installation](#installation)
 - [Case Preparation](#case-preparation)
@@ -44,6 +45,11 @@ Choose one collection workflow:
 - **Incident evidence:** start with `epx-forensics`.
 
 Both workflows then use `epx-verify` and `epx-report`.
+
+## Architecture
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the command layout, module
+responsibilities, data flows, trust boundaries, and extension points.
 
 ## Mandatory Operating Rules
 
